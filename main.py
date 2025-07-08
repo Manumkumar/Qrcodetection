@@ -1,3 +1,4 @@
+
 import cv2
 from pyzbar import pyzbar
 import requests
@@ -10,6 +11,36 @@ from contextlib import contextmanager
 import datetime
 import numpy as np
 
+# --- DNN Super-Resolution Setup ---
+try:
+    from cv2 import dnn_superres
+    DNN_SUPERRES_AVAILABLE = True
+except ImportError:
+    DNN_SUPERRES_AVAILABLE = False
+
+# Path to the super-resolution model (user must download this file, e.g., 'EDSR_x4.pb')
+SR_MODEL_PATH = "EDSR_x4.pb"  # Place the model in the same folder as this script or provide full path
+SR_MODEL_SCALE = 4
+SR_MODEL_NAME = "edsr"
+
+def load_superres_model():
+    if not DNN_SUPERRES_AVAILABLE:
+        logging.warning("cv2.dnn_superres not available. Super-resolution will be skipped.")
+        return None
+    sr = dnn_superres.DnnSuperResImpl_create()
+    if not os.path.exists(SR_MODEL_PATH):
+        logging.warning(f"Super-resolution model not found at {SR_MODEL_PATH}. Skipping superres.")
+        return None
+    try:
+        sr.readModel(SR_MODEL_PATH)
+        sr.setModel(SR_MODEL_NAME, SR_MODEL_SCALE)
+        logging.info(f"Super-resolution model loaded: {SR_MODEL_PATH}")
+        return sr
+    except Exception as e:
+        logging.warning(f"Failed to load superres model: {e}")
+        return None
+
+
 # --- CONFIGURABLE CONSTANTS ---
 CAMERA_INDEX = 0
 CAMERA_NAME = "eMeet s600"
@@ -21,9 +52,9 @@ API_TIMEOUT = 10
 # --- Auto Zoom Parameters ---
 TARGET_QR_SIZE = 300
 ZOOM_SMOOTHING = 0.1
-ZOOM_MIN = 0.90
-ZOOM_MAX = 3.0
-SEARCH_ZOOM_STEP = 0.05
+ZOOM_MIN = 1.0
+ZOOM_MAX = 6.0
+SEARCH_ZOOM_STEP = 0.5
 SEARCH_HOLD_TIME = 2.0
 
 # --- Snapshot Parameters ---
@@ -46,7 +77,7 @@ logging.basicConfig(
 
 os.environ['PYZBAR_WARNINGS'] = '0'
 
-def digital_zoom(frame, zoom_factor, center=None):
+def digital_zoom(frame, zoom_factor, center=None, superres_model=None):
     h, w = frame.shape[:2]
     if zoom_factor <= 1.0:
         return frame
@@ -67,7 +98,26 @@ def digital_zoom(frame, zoom_factor, center=None):
         y1 = max(0, h - new_h)
         y2 = h
     cropped = frame[y1:y2, x1:x2]
-    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_CUBIC)
+    # --- DNN Super-Resolution ---
+    if superres_model is not None and zoom_factor > 1.5:
+        # Upscale cropped region using DNN superres, then resize to original size
+        try:
+            # DNN superres expects 8-bit 3-channel images
+            if cropped.shape[2] == 1:
+                cropped = cv2.cvtColor(cropped, cv2.COLOR_GRAY2BGR)
+            # Upscale by model's scale (e.g., 4x)
+            upscaled = superres_model.upsample(cropped)
+            # Resize to (w, h) for display
+            zoomed = cv2.resize(upscaled, (w, h), interpolation=cv2.INTER_LANCZOS4)
+        except Exception as e:
+            logging.warning(f"Superres failed: {e}")
+            zoomed = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    else:
+        zoomed = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
+    # Sharpening filter
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    zoomed = cv2.filter2D(zoomed, -1, kernel)
+    return zoomed
 
 def preprocess_image(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -175,6 +225,7 @@ def initialize_camera():
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
     return cap
 
+
 def main():
     detector = QRDetector()
     cap = initialize_camera()
@@ -192,6 +243,9 @@ def main():
     os.makedirs(SNAPSHOT_FOLDER, exist_ok=True)
     last_snapshot_time = time.time()
     snapshot_count = 0
+
+    # --- Load DNN Super-Resolution Model ---
+    superres_model = load_superres_model()
 
     try:
         while True:
@@ -232,7 +286,7 @@ def main():
                         search_direction = 1
                     search_start_time = current_time
 
-            frame_zoomed = digital_zoom(frame, zoom_factor, center=zoom_center)
+            frame_zoomed = digital_zoom(frame, zoom_factor, center=zoom_center, superres_model=superres_model)
             codes_zoomed = detector.detect_qr_codes(frame_zoomed)
             for code in codes_zoomed:
                 (x, y, w, h) = code.rect
